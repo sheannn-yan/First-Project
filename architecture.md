@@ -1,28 +1,30 @@
-# Inventory Management System — Architecture & Technical Design
+# Inventory Management System
 
-You are acting as a **senior software architect and technical lead** helping me design a production-quality, multi-tenant inventory management system.
+## Architecture Specification v1.0
 
-Do **NOT write application code yet**.
-
-Your job in this phase is to analyze the requirements, challenge weak assumptions, identify architectural risks, and produce a complete **Architecture Specification v1.0** that can later be used as the foundation for implementation.
+**Status:** Proposed — Pending Architecture Review
+**Project Type:** Multi-tenant Inventory Management System
+**Primary Goal:** Provide a reliable, configurable, mobile-first inventory system for small and medium businesses.
 
 ---
 
-# 1. Product Vision
+# 1. Vision
 
-I want to build a configurable inventory management system that can be used by different types of businesses.
-
-Examples:
+The system is a configurable inventory management platform designed for businesses such as:
 
 * Bakeries
-* Burger/food businesses
+* Burger businesses
 * Restaurants
-* Small food manufacturers
-* Other businesses that need ingredient/material inventory
+* Food production businesses
+* Other businesses that manage ingredients, materials, recipes, and stock
 
-The system should solve the actual inventory problem rather than becoming overloaded with unnecessary features.
+The system must solve real inventory problems without unnecessary features or business-specific hard-coding.
 
-A bakery might have:
+The same application must be able to support different businesses through configuration and data.
+
+Example:
+
+### Bakery
 
 * Flour
 * Sugar
@@ -30,289 +32,484 @@ A bakery might have:
 * Butter
 * Milk
 
-A burger business might have:
+### Burger Business
 
 * Burger buns
-* Beef
+* Beef patties
 * Mayonnaise
 * Cheese
 * Lettuce
-* Tomatoes
 
-The same application should support both businesses without hard-coded business-specific logic.
+The application must not contain business-specific logic such as:
 
-The system must be **configuration/data driven**.
+```text
+if business == "Bakery"
+```
+
+Instead, businesses configure their own ingredients, recipes, suppliers, units, branches, and inventory.
 
 ---
 
-# 2. Technology Direction
+# 2. Core Architectural Principles
 
-The planned technology stack is:
+The system follows these principles:
 
-### Frontend
+1. **Multi-tenant by design**
+2. **Mobile-first**
+3. **Offline-capable**
+4. **Cloud-backed**
+5. **Auditability**
+6. **Transaction-based inventory**
+7. **Server-side business rules**
+8. **Configuration over hard-coding**
+9. **Modular and feature-oriented architecture**
+10. **Extensible without unnecessary complexity**
+
+Inventory data is business-critical and must prioritize correctness over convenience.
+
+---
+
+# 3. High-Level Architecture
+
+```text
+                         USERS
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+          Mobile                       Desktop
+             │                           │
+             └─────────────┬─────────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │   Next.js PWA   │
+                  │    Frontend     │
+                  └────────┬────────┘
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+             ▼                           ▼
+      Local Device DB              Spring Boot API
+       (Offline Data)                    │
+             │                           │
+             │                           ▼
+             │                    Business Logic
+             │                           │
+             │                           ▼
+             │                     PostgreSQL
+             │                      / Supabase
+             │                           │
+             └──────────── Sync ─────────┘
+                                         │
+                                         ▼
+                                       n8n
+                                   Automations
+
+                         Future Integrations
+                                │
+                         ┌──────┴──────┐
+                         │             │
+                      Node-RED        AI
+```
+
+---
+
+# 4. Technology Stack
+
+## Frontend
 
 * Next.js
-* Responsive/mobile-first UI
-* PWA capabilities
-* Android/iPhone/tablet/laptop support
+* React
+* TypeScript
+* Responsive UI
+* Progressive Web App (PWA)
+* Local browser database for offline capability
 
-### Backend
+## Backend
 
 * Java
 * Spring Boot
 * REST API
-* Business logic should primarily live in the backend
+* Server-side business rules
+* Validation
+* Authorization
+* Transaction management
 
-### Database / Cloud
+## Database / Cloud
 
 * Supabase
 * PostgreSQL
 
-### Offline
+Supabase provides infrastructure around the PostgreSQL database and may also provide authentication, storage, realtime capabilities, and other supporting services where appropriate.
 
-* Browser local database/storage, potentially IndexedDB/Dexie or an equivalent appropriate solution
-* Offline-first capabilities
-* Synchronization with the cloud when connectivity returns
-
-### Automation
+## Automation
 
 * n8n
 
-### Future integrations
+## Future Integration
 
-* Node-RED for hardware/IoT/integration use cases
+* Node-RED
 
-### Future AI
+## Future AI
 
-AI may later be added for:
+* AI services for insights and natural-language interaction
 
-* Inventory insights
-* Purchasing suggestions
-* Natural-language queries
-* Reports/analysis
-
-However, AI must NOT be responsible for critical inventory calculations or directly become the source of truth for inventory.
+AI must not become the source of truth for inventory.
 
 ---
 
-# 3. Multi-Tenant Architecture
+# 5. Multi-Tenant Architecture
 
-The system must support multiple businesses using the same application.
+The system supports multiple independent businesses.
 
-For example:
+The fundamental hierarchy is:
 
-Business A:
+```text
+Organization
+│
+├── Users
+│
+├── Roles
+│
+├── Devices
+│
+├── Branches
+│
+├── Suppliers
+│
+├── Ingredients
+│
+├── Recipes
+│
+└── Inventory
+```
 
-* Bakery
-* 1 branch
-* 5 users
+Each organization must be isolated from every other organization.
 
-Business B:
+A user belonging to Organization A must never be able to access Organization B's data.
 
-* Burger business
-* 3 branches
-* 10 users
-
-The architecture must prevent data from one organization/business from being exposed to another.
-
-A business should be able to configure its own:
-
-* Branches
-* Users
-* Roles
-* Ingredients
-* Units
-* Suppliers
-* Recipes
-* Inventory locations
-* Purchases
-* Production
-
-Do not hard-code any business-specific ingredients or workflows.
+Tenant isolation must be enforced server-side and at the database/security layer where appropriate.
 
 ---
 
-# 4. Branches and Locations
+# 6. Branch Architecture
 
-Businesses can have multiple branches.
+An organization may have one or multiple branches.
 
 Example:
 
-Minute Burger:
+```text
+Minute Burger
+│
+├── Branch 1
+│   ├── Main Storage
+│   └── Kitchen
+│
+├── Branch 2
+│   ├── Main Storage
+│   └── Kitchen
+│
+└── Branch 3
+    ├── Main Storage
+    └── Kitchen
+```
 
-* Branch 1
-* Branch 2
-* Branch 3
+The system must support both:
 
-Each branch may have inventory locations such as:
+```text
+Business → One Branch
+```
 
-* Main storage
-* Kitchen
-* Freezer
-* Refrigerator
+and:
 
-Clearly distinguish:
+```text
+Business → Multiple Branches
+```
 
-**Supplier location**
-
-from:
-
-**Business branch**
-
-from:
-
-**Inventory storage location**
-
-The architecture should allow a business to use one branch or many branches without requiring a different application.
+without requiring separate applications.
 
 ---
 
-# 5. Users, Roles and Authentication
+# 7. Inventory Locations
 
-Authentication is required.
+A branch may contain multiple inventory locations.
 
-The system should support:
+Examples:
+
+* Main Storage
+* Kitchen
+* Freezer
+* Refrigerator
+* Warehouse
+
+The system must distinguish:
+
+```text
+Supplier Location
+```
+
+from:
+
+```text
+Business Branch
+```
+
+and:
+
+```text
+Inventory Location
+```
+
+Future inventory transfers between branches and locations should be possible without requiring a major architectural redesign.
+
+---
+
+# 8. Users and Roles
+
+The system supports:
 
 * Owner
 * Manager
 * Staff
 
-Some businesses may only use Owner + Staff.
-
-Unused roles should be configurable/hidden from the UI rather than requiring every business to use every role.
-
-Users must be associated with an organization/business.
-
-Users may also have access restrictions by branch.
-
-Example:
-
-A staff member assigned to Branch 2 should not automatically be able to modify Branch 1 inventory unless authorized.
-
-Design an appropriate role/permission model.
-
----
-
-# 6. Device Tracking
-
-The system must track devices.
-
-This is important because a small business may have only ONE physical device.
+Not every organization must use every role.
 
 For example:
 
-Minute Burger Branch 1:
+```text
+Small Business
+├── Owner
+└── Staff
+```
 
-* One Android tablet
+Another organization may use:
 
-Different users may log into that same tablet:
+```text
+Larger Business
+├── Owner
+├── Manager
+└── Staff
+```
+
+Unused roles may be hidden from the organization's UI.
+
+Roles should control permissions.
+
+Permissions may also be restricted by branch.
+
+Example:
+
+```text
+Staff A
+→ Branch 1
+
+Staff B
+→ Branch 2
+
+Manager
+→ Branch 1 + Branch 2 + Branch 3
+
+Owner
+→ Entire organization
+```
+
+---
+
+# 9. Authentication
+
+Authentication is required.
+
+The system must identify the authenticated user for important actions.
+
+A device does not represent a user.
+
+Example:
+
+```text
+Tablet #01
 
 Morning:
-
-* Maria
+Maria logs in
 
 Afternoon:
-
-* John
+John logs in
 
 Evening:
+Pedro logs in
+```
 
-* Pedro
+Actions must be attributed to:
+
+* User
+* Organization
+* Branch
+* Device
+* Timestamp
+
+Authentication must remain secure even when offline capabilities are introduced.
+
+Offline authentication behavior must be explicitly designed and tested.
+
+---
+
+# 10. Device Tracking
+
+Devices should have a unique device identity.
+
+Example:
+
+```text
+Device:
+TABLET-01
+
+Organization:
+Minute Burger
+
+Branch:
+Branch 1
+```
+
+A device may be shared by multiple users.
 
 Therefore:
 
-**Device identity must NOT be used as the identity of the person performing an action.**
+```text
+Device ID ≠ User ID
+```
 
-Important inventory actions must record at minimum:
-
-* Organization
-* Branch
-* User
-* Device
-* Timestamp
-* Transaction/action ID
+Both must be recorded when appropriate.
 
 ---
 
-# 7. Audit Trail and Corrections
+# 11. Inventory Model
 
-This is a major requirement.
+Inventory must be transaction-based.
 
-Inventory changes must be traceable.
-
-The system should NOT silently overwrite important inventory history.
-
-For example:
-
-System says:
-
-5 kg flour
-
-User realizes it should have been:
-
-4 kg flour
-
-The system should allow a stock adjustment, but the user must provide a reason.
+The system must not rely solely on overwriting a single current quantity.
 
 Example:
 
-Previous:
-5 kg
+```text
+Initial stock       +25 kg
+Purchase            +10 kg
+Production           -5 kg
+Manual adjustment    -1 kg
+--------------------------------
+Current stock        29 kg
+```
 
-New:
+Inventory movements should be represented as transactions.
+
+Possible transaction types include:
+
+* Opening balance
+* Purchase
+* Production consumption
+* Stock adjustment
+* Stock correction
+* Transfer
+* Return
+* Waste
+* Other controlled inventory events
+
+Transaction types should be extensible.
+
+---
+
+# 12. Inventory Adjustments
+
+Manual corrections are allowed.
+
+However, important corrections require a reason.
+
+Example:
+
+```text
+System:
+Flour = 5 kg
+
+Actual:
+Flour = 4 kg
+```
+
+The user selects:
+
+```text
+Adjust Stock
+```
+
+and provides:
+
+```text
+New quantity:
 4 kg
 
 Reason:
-"Incorrect quantity entered"
+Incorrect quantity entered
+```
 
 The system records:
 
-* User
-* Branch
-* Device
-* Date/time
-* Item
-* Previous quantity
-* New quantity
-* Difference
-* Reason
+```text
+User
+Organization
+Branch
+Device
+Ingredient
+Previous quantity
+New quantity
+Difference
+Reason
+Timestamp
+```
 
-No approval is required for normal corrections.
+No approval is required for normal manual corrections.
 
-However, the reason is mandatory.
-
-For important transactions, prefer **void/cancellation** over physical deletion.
-
-Never destroy important historical inventory transactions simply to make the current state look correct.
-
-Explain which operations require audit records.
+The reason is mandatory.
 
 ---
 
-# 8. Inventory Transactions
+# 13. Audit Trail
 
-Do NOT design the system around simply storing and overwriting:
+Important business actions must be auditable.
 
-current_stock = 25
+The system should answer:
 
-Instead, design an inventory movement/transaction model.
+> Who changed it?
 
-Examples:
+> What changed?
 
-+25 kg — Purchase
--5 kg — Production
--1 kg — Manual adjustment
-+2 kg — Stock correction
+> When did it change?
 
-The current quantity can be derived from valid inventory movements or maintained as a controlled projection/cache.
+> Where did it happen?
 
-The architecture should explain which approach is safest and most performant.
+> On which device?
 
-Inventory transaction types should be extensible.
+> Why was it changed?
+
+Audit information should include where applicable:
+
+```text
+user_id
+organization_id
+branch_id
+device_id
+action
+entity
+entity_id
+previous_value
+new_value
+reason
+timestamp
+```
+
+Important historical transactions should not be physically deleted.
+
+Instead, use controlled cancellation/voiding where appropriate.
 
 ---
 
-# 9. Units and Measurements
+# 14. Units
 
 The system must support flexible units.
 
@@ -329,101 +526,146 @@ Examples:
 * Bottle
 * Pack
 * Tray
-* Other configurable units
 
-Do NOT hard-code units into the application.
+Units must not be hard-coded into business logic.
 
-Businesses should be able to define appropriate units where necessary.
+Businesses may configure appropriate units.
 
 ---
 
-# 10. Purchase Unit vs Consumption Unit
+# 15. Unit Conversion
 
-This is very important.
-
-An ingredient may be purchased using one unit but consumed using another.
+Purchase units and consumption units may be different.
 
 Example:
 
-Mayonnaise:
+```text
+Mayonnaise
 
-Purchase:
-1 tub = 5 kg
+1 Tub = 5 kg
+```
 
 Recipe:
 
-20 g mayonnaise per burger
+```text
+20 g mayonnaise / burger
+```
 
-If the business buys:
+Inventory internally needs a reliable representation that allows:
 
+```text
 2 tubs
+=
+10 kg
+=
+10,000 g
+```
 
-The system should understand:
+Producing:
 
-2 tubs = 10 kg = 10,000 g
+```text
+100 burgers
+```
 
-Then if 100 burgers are produced:
+consumes:
 
-100 × 20 g = 2,000 g consumed
+```text
+2,000 g
+```
 
 Remaining:
 
+```text
 8,000 g
+```
 
-The UI may display quantities using a human-friendly unit.
+The system must support explicit conversion relationships.
 
-Design a robust unit conversion model.
+Non-convertible units such as:
 
-Explain how to handle units that cannot safely be converted, such as:
+```text
+Box
+Pack
+Piece
+```
 
-* Box
-* Pack
-* Piece
-
-unless the business explicitly defines the relationship.
+must require an explicit business-defined relationship before conversion.
 
 ---
 
-# 11. Suppliers
+# 16. Ingredients
 
-The system should track suppliers.
+An ingredient represents an inventory-controlled item.
+
+Example:
+
+```text
+Ingredient:
+Mayonnaise
+
+Base measurement:
+Gram
+
+Purchase units:
+Tub
+
+Suppliers:
+Supplier A
+Supplier B
+```
+
+Ingredients should support:
+
+* Name
+* Description
+* Category
+* Unit configuration
+* Minimum stock level
+* Maximum stock level if needed
+* Active/inactive state
+* Supplier relationships
+* Branch/location availability
+
+---
+
+# 17. Suppliers
+
+Suppliers belong to an organization.
+
+A supplier may provide multiple ingredients.
+
+An ingredient may have multiple suppliers.
 
 Supplier information may include:
 
-* Supplier name
+* Name
 * Contact information
-* Location
+* Address/location
 * Pickup/delivery information
-* Items supplied
-* Supplier-specific price
-* Purchase history
 * Notes
 * Active/inactive status
 
-The architecture should support one ingredient being supplied by multiple suppliers.
+Supplier-item relationships may include:
 
-Example:
+* Supplier
+* Ingredient
+* Purchase unit
+* Unit conversion
+* Price
+* Effective date
+* Supplier SKU/reference
 
-Flour:
-
-Supplier A:
-₱1,200 / 25 kg
-
-Supplier B:
-₱1,250 / 25 kg
-
-The system should be able to maintain supplier-specific purchasing information without assuming that an ingredient has only one supplier.
+Supplier price history should be preserved where appropriate.
 
 ---
 
-# 12. Purchases
+# 18. Purchases
 
-The system should support actual purchase records.
+The system should support purchase records.
 
 Example:
 
-Purchase:
-
+```text
 Supplier:
 ABC Supplier
 
@@ -432,107 +674,108 @@ August 9, 2026
 
 Items:
 
-3 bags flour
-₱1,200 each
+3 bags Flour
+2 tubs Mayonnaise
+```
 
-2 tubs mayonnaise
-₱450 each
+Purchases should create inventory transactions.
 
-Purchases should create appropriate inventory transactions.
+Purchase records should preserve:
 
-Explain how purchase price/history should be modeled.
-
----
-
-# 13. Recipes
-
-The system must support configurable recipes.
-
-Example:
-
-Classic Burger:
-
-1 bun
-1 beef patty
-20 g mayonnaise
-1 slice cheese
-30 g lettuce
-
-A bakery could instead define:
-
-Bread:
-
-500 g flour
-50 g sugar
-5 g yeast
-20 g butter
-250 ml water
-
-Recipes should not be hard-coded.
-
-Businesses must be able to:
-
-* Create recipe
-* Edit recipe
-* Add ingredients
-* Remove ingredients
-* Define quantity
-* Define consumption unit
-* Activate/deactivate recipe
+* Supplier
+* Branch/location
+* User
+* Device
+* Date/time
+* Items
+* Quantities
+* Units
+* Prices
+* Total
+* Reference number if applicable
 
 ---
 
-# 14. Production
+# 19. Recipes
 
-Recipes should connect to production.
+Recipes are configurable business data.
 
 Example:
 
+```text
+Classic Burger
+
+1 × Bun
+1 × Beef Patty
+20 g Mayonnaise
+1 × Cheese Slice
+30 g Lettuce
+```
+
+A bakery may instead define:
+
+```text
+Bread
+
+500 g Flour
+50 g Sugar
+5 g Yeast
+20 g Butter
+250 ml Water
+```
+
+Recipes must support:
+
+* Create
+* Edit
+* Activate/deactivate
+* Ingredients
+* Quantities
+* Consumption units
+* Recipe versions/history where necessary
+
+Recipes must not be hard-coded.
+
+---
+
+# 20. Production
+
+Production connects recipes to inventory.
+
+Example:
+
+```text
 Produce:
+50 Classic Burgers
+```
 
-50 burgers
-
-The system calculates the required ingredients and creates inventory movements.
-
-For example:
-
-50 buns
-50 beef patties
-1,000 g mayonnaise
-50 cheese slices
-1,500 g lettuce
-
-The backend should validate inventory availability before completing production.
-
-Explain how production should behave when inventory is insufficient.
-
----
-
-# 15. Inventory Locations
-
-Inventory should be location-aware.
+The system calculates required ingredients.
 
 Example:
 
-Branch 1:
+```text
+50 Buns
+50 Beef Patties
+1,000 g Mayonnaise
+50 Cheese Slices
+1,500 g Lettuce
+```
 
-* Main Storage
-* Kitchen
-* Freezer
+The backend validates inventory availability and creates appropriate inventory transactions.
 
-The system should know where stock exists.
+Production must be atomic where appropriate.
 
-Consider whether stock transfers between locations/branches should be part of the MVP or a later phase, but design the architecture so that it can be supported later without major restructuring.
+A partially completed production transaction should not leave inventory in an inconsistent state.
 
 ---
 
-# 16. Search, Filtering and Sorting
+# 21. Inventory Search and Filtering
 
-The inventory UI should support:
+Inventory must support:
 
 * Live search while typing
-* Column filtering
 * Sorting
+* Filtering
 * Supplier filtering
 * Branch filtering
 * Location filtering
@@ -540,516 +783,725 @@ The inventory UI should support:
 * Unit filtering
 * Status filtering
 
-It must work well on mobile devices.
+Desktop may use tables.
 
-Desktop can use a traditional table.
-
-Mobile may use cards/list views rather than forcing a large table onto a phone.
+Mobile should use a responsive list/card representation where appropriate.
 
 ---
 
-# 17. Offline-First Requirement
+# 22. Mobile-First Design
 
-This is a major requirement.
+The system must prioritize:
 
-The system should still be usable when the internet connection is temporarily unavailable.
+* Android phones
+* iPhones
+* Tablets
 
-Example:
+Desktop/laptop support is also required.
 
-A tablet is being used in a bakery.
+The system should not simply shrink a desktop interface onto a phone.
 
-Internet goes offline.
+Mobile workflows should prioritize:
 
-The user can still:
-
-* View relevant inventory
-* Perform allowed inventory operations
-* Record production
-* Make stock adjustments
-* Possibly record purchases depending on the design
-
-The actions are stored locally.
-
-When the internet returns, they synchronize with the server.
-
-The user should be able to see synchronization state.
-
-Example:
-
-🟡 Pending synchronization
-
-then:
-
-🟢 Synchronized
+* Fast searching
+* Quick stock checks
+* Quick adjustments
+* Production entry
+* Purchase entry
+* Clear status indicators
+* Minimal unnecessary navigation
 
 ---
 
-# 18. Offline Synchronization
+# 23. Progressive Web App
 
-Design a robust synchronization strategy.
+The frontend should be designed as a PWA.
 
-Consider:
+Users should eventually be able to install the application on supported devices.
 
-* Local database
-* Pending operation queue
-* Transaction IDs
-* Device IDs
-* User IDs
-* Organization IDs
-* Timestamps
+Example:
+
+```text
+Phone
+ ↓
+Open Web Application
+ ↓
+Install/Add to Home Screen
+ ↓
+Inventory Application
+```
+
+The PWA should support offline operation where technically appropriate.
+
+---
+
+# 24. Offline Architecture
+
+The system must continue operating during temporary internet outages.
+
+The device should maintain local application data required for offline workflows.
+
+Conceptually:
+
+```text
+Next.js PWA
+│
+├── Online
+│    └── Spring Boot API
+│
+└── Offline
+     └── Local Database
+          └── Pending Operations
+```
+
+Offline operations may include:
+
+* Viewing cached inventory
+* Stock adjustments
+* Production
+* Other approved inventory operations
+
+The exact offline feature set must be defined during implementation.
+
+---
+
+# 25. Synchronization
+
+Offline operations must be queued.
+
+Example:
+
+```text
+Pending Operations
+
+001  STOCK_ADJUSTMENT  Pending
+002  PRODUCTION        Pending
+003  PURCHASE          Pending
+```
+
+When connectivity returns:
+
+```text
+Local Queue
+    ↓
+Synchronization
+    ↓
+Spring Boot
+    ↓
+Validation
+    ↓
+PostgreSQL
+    ↓
+Synchronization Result
+```
+
+Each operation should have a globally unique transaction/operation identifier.
+
+Synchronization must support:
+
 * Idempotency
-* Retry behavior
+* Retry
 * Duplicate prevention
-* Network failure
-* Partial synchronization
+* Partial failure handling
+* Server validation
 * Conflict detection
 * Conflict resolution
-* Server validation
-* Authentication while offline
-* What happens if the same inventory item is changed on two devices while offline?
+
+The system must not simply overwrite server inventory with a stale local quantity.
+
+Inventory changes should synchronize as business events/transactions where possible.
+
+---
+
+# 26. Offline Conflict Example
 
 Example:
 
-Device A:
+Initial stock:
 
-25 kg → consumes 5 kg
+```text
+25 kg
+```
 
-Device B:
+Device A offline:
 
-25 kg → receives 10 kg
+```text
+Consumes 5 kg
+```
 
-Both operate offline.
+Device B offline:
 
-When both reconnect, the architecture must safely reconcile the operations.
+```text
+Receives 10 kg
+```
 
-Do NOT simply overwrite one device's stock with the other.
+When both reconnect, the system should process the operations safely:
 
-Explain the recommended synchronization model.
+```text
+25
+-5
++10
+----
+30 kg
+```
+
+It must not perform:
+
+```text
+Device A current = 20
+Device B current = 35
+
+Last device wins
+```
+
+because this could destroy legitimate inventory activity.
+
+Conflict handling rules must be explicitly documented and tested.
 
 ---
 
-# 19. Data Integrity
+# 27. Backend Responsibilities
 
-Inventory is business-critical.
+Spring Boot is responsible for:
 
-The architecture should prioritize:
-
-* Transaction integrity
-* Auditability
-* Idempotency
-* Concurrency safety
-* Validation
+* Business rules
+* Inventory calculations
+* Unit conversion validation
+* Production calculations
+* Inventory transaction creation
 * Authorization
-* Data isolation between tenants
-* Reliable synchronization
-
-Do not rely on frontend validation alone.
-
-Critical business rules must be enforced server-side.
-
----
-
-# 20. Backend Architecture
-
-Design a maintainable Spring Boot architecture.
-
-Prefer a domain/feature-oriented structure rather than putting every controller/service/repository into giant global folders.
-
-Potential domains include:
-
-* Authentication
-* Organization
-* Branch
-* User
-* Device
-* Ingredient
-* Unit
-* Supplier
-* Purchase
-* Recipe
-* Production
-* Inventory
-* Audit
-
-Do not blindly accept this list. Modify it if a better domain model exists.
-
-Explain:
-
-* Package structure
-* Domain boundaries
-* DTOs
-* Services
-* Repositories
-* Controllers
 * Validation
-* Exception handling
-* Transactions
-* Security
-* Testing strategy
+* Concurrency handling
+* Audit creation
+* Synchronization validation
+* API contracts
+
+Critical business rules must not depend solely on frontend validation.
 
 ---
 
-# 21. Frontend Architecture
+# 28. Frontend Responsibilities
 
-Design a scalable Next.js architecture.
+Next.js is responsible for:
 
-It must support:
+* User interface
+* Responsive design
+* PWA behavior
+* User interactions
+* Local offline storage
+* Sync status
+* API communication
+* Client-side validation
+* Presentation
 
-* Mobile-first UI
-* PWA
-* Offline state
-* Local data
-* Synchronization state
-* Authentication
-* Permissions
-* Branch selection
-* Inventory
-* Recipes
-* Suppliers
-* Purchases
-* Production
-* Audit history
-
-Prefer feature/domain-oriented organization.
-
-Explain:
-
-* Routing
-* Components
-* Hooks
-* State management
-* API layer
-* Local database layer
-* Sync layer
-* Authentication handling
-* Form validation
-* Error handling
-* Loading states
-* Offline states
+The frontend should not be the final authority for business-critical calculations.
 
 ---
 
-# 22. Supabase
+# 29. Supabase Responsibilities
 
-Explain which Supabase capabilities should be used.
+Supabase/PostgreSQL is responsible for persistent cloud data storage and supporting infrastructure.
 
-Consider:
+Potential capabilities:
 
 * PostgreSQL
-* Authentication
+* Authentication where appropriate
 * Row Level Security
-* Storage if necessary
-* Realtime if useful
-* Database functions if appropriate
+* Storage if required
+* Realtime capabilities where useful
 
-The architecture must clearly define what responsibility belongs to:
+The final architecture must clearly define the boundary between:
 
-**Next.js**
+```text
+Next.js
+Spring Boot
+Supabase
+```
 
-vs
-
-**Spring Boot**
-
-vs
-
-**Supabase**
-
-Do not allow business-critical inventory logic to become scattered across all three.
+Business-critical inventory operations should remain controlled by the backend/database architecture rather than being freely writable from the frontend.
 
 ---
 
-# 23. n8n
+# 30. n8n Responsibilities
 
-n8n should be an automation/integration layer rather than the core inventory engine.
+n8n is an automation/integration layer.
 
-Potential future workflows:
+Potential workflows:
 
-* Low-stock notifications
-* Supplier reminders
-* Scheduled inventory reports
-* Daily/weekly summaries
-* Notifications when stock reaches thresholds
-* Purchase reminders
+```text
+Low stock
+   ↓
+n8n
+   ↓
+Notification
+```
 
-Explain where n8n should connect to the system and how it should avoid becoming a source of truth.
+```text
+Scheduled report
+   ↓
+n8n
+   ↓
+Owner notification
+```
+
+```text
+Supplier reminder
+   ↓
+n8n
+```
+
+n8n must not become the source of truth for inventory.
 
 ---
 
-# 24. Node-RED
+# 31. Node-RED Responsibilities
 
-Node-RED is optional/future.
+Node-RED is optional and future-facing.
 
-Possible future use cases:
+Potential integrations:
 
 * Digital weighing scales
-* Barcode scanners
 * Sensors
+* Barcode scanners
 * IoT devices
-* Hardware integrations
+* Hardware systems
 
-Do not add Node-RED into the core architecture unless there is a concrete reason.
+Node-RED should connect through defined integration/API boundaries.
 
-Design an integration boundary that allows it later.
+It is not required for the core application.
 
 ---
 
-# 25. AI
+# 32. AI Responsibilities
 
-AI is NOT part of the core inventory calculation engine.
+AI is optional and future-facing.
 
-Potential future AI features:
+Potential capabilities:
 
-* "What ingredients are running low?"
-* "What should I purchase this week?"
 * Inventory summaries
-* Natural-language reports
+* Natural-language inventory questions
+* Purchasing suggestions
+* Trend explanations
 * Anomaly explanations
-* Business insights
 
-AI may recommend or explain things, but deterministic backend logic remains responsible for actual inventory calculations and database changes.
+AI must not directly determine authoritative inventory quantities.
+
+For example:
+
+```text
+AI:
+"You may need more flour next week."
+```
+
+is acceptable.
+
+But:
+
+```text
+AI:
+"Set flour stock to 50 kg."
+```
+
+must not bypass deterministic business rules and authorization.
 
 ---
 
-# 26. Architecture Deliverables
+# 33. Suggested Domain Boundaries
 
-Before any implementation, produce the following:
+The backend should be organized around business capabilities rather than only technical layers.
 
-## A. Executive architecture overview
+Potential domains:
 
-Explain the complete system in understandable language.
+```text
+authentication
+organization
+user
+role
+branch
+device
+ingredient
+unit
+supplier
+purchase
+recipe
+production
+inventory
+audit
+synchronization
+```
 
-## B. Architecture diagram
+This list may be refined during detailed design.
 
-Show:
+---
 
-User
-→ Next.js PWA
-→ Local database
-→ Spring Boot
-→ Supabase/PostgreSQL
+# 34. Backend Folder Structure
 
-Also show:
+The backend should use a feature/domain-oriented structure.
 
-n8n
+Conceptually:
 
-and future Node-RED/AI integrations.
+```text
+backend/
+└── src/
+    └── main/
+        └── java/
+            └── com/
+                └── application/
+                    │
+                    ├── authentication/
+                    ├── organization/
+                    ├── user/
+                    ├── role/
+                    ├── branch/
+                    ├── device/
+                    ├── ingredient/
+                    ├── unit/
+                    ├── supplier/
+                    ├── purchase/
+                    ├── recipe/
+                    ├── production/
+                    ├── inventory/
+                    ├── audit/
+                    ├── synchronization/
+                    │
+                    └── common/
+```
 
-## C. Multi-tenant architecture
+Each domain may contain appropriate:
 
-Explain how organizations, branches, users, roles and devices relate.
+```text
+controller
+service
+repository
+domain/model
+dto
+mapper
+validation
+```
 
-## D. Database ERD
+The exact structure should be refined during implementation.
 
-Provide a detailed ERD.
+---
 
-Include:
+# 35. Frontend Folder Structure
 
-* Tables
-* Primary keys
-* Foreign keys
-* Relationships
-* Important indexes
-* Important constraints
+The frontend should also use feature-oriented organization.
 
-Do not create unnecessary tables.
+Conceptually:
 
-## E. Domain model
+```text
+frontend/
+├── app/
+├── features/
+│   ├── authentication/
+│   ├── inventory/
+│   ├── ingredients/
+│   ├── suppliers/
+│   ├── purchases/
+│   ├── recipes/
+│   ├── production/
+│   ├── branches/
+│   └── users/
+│
+├── components/
+├── lib/
+│   ├── api/
+│   ├── database/
+│   ├── synchronization/
+│   └── validation/
+│
+├── hooks/
+├── types/
+└── public/
+```
 
-Explain the major business concepts and how they interact.
+The final Next.js structure should follow the current framework conventions chosen during implementation.
 
-## F. Offline synchronization architecture
+---
 
-This is extremely important.
+# 36. API Boundary
 
-Provide a sequence diagram for:
+The system should expose business-oriented REST APIs.
 
-1. Online transaction
-2. Offline transaction
-3. Reconnection
-4. Synchronization
-5. Conflict
-6. Retry
-7. Duplicate prevention
+Potential areas:
 
-## G. Authentication and authorization model
+```text
+/api/auth
+/api/organizations
+/api/users
+/api/branches
+/api/devices
+/api/ingredients
+/api/units
+/api/suppliers
+/api/purchases
+/api/recipes
+/api/production
+/api/inventory
+/api/audit
+/api/synchronization
+```
 
-Explain:
+Exact endpoints should be defined during API design.
 
-* Login
-* Sessions/tokens
-* Roles
-* Permissions
-* Branch access
-* Offline authentication considerations
+---
 
-## H. Audit architecture
+# 37. Security Requirements
 
-Show how the system records:
-
-* Who
-* What
-* When
-* Where
-* Device
-* Previous value
-* New value
-* Reason
-
-## I. API design
-
-Provide proposed REST endpoints.
-
-For each major endpoint explain:
-
-* HTTP method
-* URL
-* Purpose
-* Authentication
-* Authorization
-* Request
-* Response
-* Important validation
-
-## J. Folder structure
-
-Provide recommended production-quality folder structures for:
-
-* Next.js
-* Spring Boot
-
-Explain why the structure is maintainable.
-
-## K. Security architecture
-
-Consider:
+Security must include:
 
 * Authentication
 * Authorization
 * Tenant isolation
-* Row Level Security
-* API security
-* Input validation
-* Rate limiting
+* Branch access control
+* Server-side validation
+* Database constraints
+* Secure secrets
+* API protection
 * Audit logging
-* Secrets
-* Device identification
-* Offline security
+* Secure device identification
+* Safe offline authentication
+* Protection against duplicate/replayed synchronization requests
 
-## L. Testing architecture
+No secret keys should be committed to Git.
 
-Recommend:
+Environment variables must be used for credentials and secrets.
+
+---
+
+# 38. Testing Requirements
+
+The system should eventually include:
+
+### Backend
 
 * Unit tests
-* Integration tests
+* Service tests
+* Repository/integration tests
 * API tests
-* Database tests
-* Frontend tests
-* E2E tests
-* Offline/synchronization tests
+* Transaction tests
 * Concurrency tests
 
-## M. Deployment architecture
+### Frontend
 
-Recommend a practical deployment approach for:
+* Component tests
+* Form validation tests
+* Integration tests
+* Offline behavior tests
 
-* Next.js
-* Spring Boot
-* Supabase
-* n8n
+### End-to-End
 
-Keep cost and simplicity in mind.
+Test important workflows:
 
-## N. MVP scope
+```text
+Login
+→ Select branch
+→ View inventory
+→ Purchase stock
+→ Produce product
+→ Stock decreases
+→ Adjust stock
+→ Enter reason
+→ Audit recorded
+```
 
-Clearly divide:
+### Synchronization
 
-### MVP
+Test:
 
-What must exist for the first usable version.
-
-### Phase 2
-
-Useful but not required initially.
-
-### Future
-
-Advanced automation, AI, IoT, etc.
-
-Avoid feature creep.
-
----
-
-# 27. Critical Review
-
-Before finalizing your proposal, challenge the requirements.
-
-Identify:
-
-1. Architectural risks
-2. Potential overengineering
-3. Missing requirements
-4. Database risks
-5. Offline-sync risks
-6. Security risks
-7. Multi-tenant risks
-8. Scalability concerns
-9. UX problems
-10. Places where the chosen technology stack may be unnecessarily complicated
-
-If you believe any of my technology choices are inappropriate, **say so clearly and explain why**.
-
-Do not agree with me simply because I suggested something.
+* Offline operation
+* Reconnection
+* Retry
+* Duplicate submission
+* Concurrent changes
+* Conflict handling
+* Partial synchronization
 
 ---
 
-# 28. Important Constraints
+# 39. MVP
 
-Do NOT:
+The first usable version should focus on the core inventory problem.
 
-* Generate application code yet
-* Generate hundreds of files
-* Assume one business only
-* Hard-code bakery/burger logic
-* Make AI responsible for inventory calculations
-* Make n8n the core business logic
-* Make Node-RED a required dependency
-* Physically delete important transaction history
-* Allow frontend-only enforcement of critical business rules
-* Treat the current stock number as the only source of truth
-* Ignore offline synchronization
-* Ignore auditability
+## MVP
+
+### Authentication
+
+* Login
+* Users
+* Roles
+* Branch access
+
+### Organization
+
+* Business
+* Branches
+* Devices
+
+### Inventory
+
+* Ingredients
+* Units
+* Unit conversion
+* Stock
+* Inventory transactions
+* Manual adjustments
+* Audit trail
+* Search
+* Sorting
+* Filtering
+
+### Suppliers
+
+* Supplier management
+* Supplier items
+* Supplier pricing
+* Purchase records
+
+### Recipes
+
+* Create recipes
+* Add ingredients
+* Define quantities
+* Production
+* Automatic inventory consumption
+
+### PWA
+
+* Responsive UI
+* Basic offline foundation
+
+The exact offline transaction scope should be finalized during implementation.
 
 ---
 
-# 29. Final Output
+# 40. Phase 2
 
-At the end, provide:
+Potential features:
 
-### Architecture Status
+* Full offline synchronization
+* Advanced inventory transfers
+* Advanced reports
+* Purchase recommendations
+* Stock forecasting
+* More detailed supplier management
+* Advanced permissions
+* Notifications
+* n8n automation
 
-Choose one:
+---
 
-* READY FOR IMPLEMENTATION
-* NEEDS REQUIREMENT CLARIFICATION
-* NEEDS ARCHITECTURAL CHANGES
+# 41. Future
 
-If clarification is required, list only the questions that genuinely block implementation.
+Potential future capabilities:
 
-Otherwise, produce the complete Architecture Specification v1.0.
+* AI inventory assistant
+* Demand forecasting
+* Natural-language reports
+* Automated purchasing suggestions
+* Barcode scanning
+* Digital scales
+* IoT integrations
+* Node-RED integrations
+* Advanced analytics
 
-Do not start coding.
+These must not compromise the reliability of the core inventory system.
 
-The goal of this phase is to create an architecture that is:
+---
 
-* Maintainable
-* Secure
-* Multi-tenant
-* Offline-capable
-* Synchronizable
-* Mobile-first
-* Extensible
-* Testable
-* Practical
-* Not unnecessarily overengineered
+# 42. Important Architectural Rule
 
-I want this to be a real-world system that could eventually be used by businesses, not just a tutorial/demo project.
+The system should follow this principle:
+
+```text
+USER
+ ↓
+Next.js PWA
+ ↓
+Spring Boot
+ ↓
+Business Rules
+ ↓
+Inventory Transactions
+ ↓
+PostgreSQL / Supabase
+```
+
+While:
+
+```text
+n8n
+```
+
+handles automation,
+
+```text
+Node-RED
+```
+
+handles future hardware/integration requirements,
+
+and:
+
+```text
+AI
+```
+
+provides optional intelligence and recommendations.
+
+The core inventory system must remain deterministic and auditable.
+
+---
+
+# 43. Architecture Review Checklist
+
+Before implementation begins, verify:
+
+* [ ] Multi-tenant isolation is defined
+* [ ] Branch access is defined
+* [ ] Roles and permissions are defined
+* [ ] Device tracking is defined
+* [ ] Inventory transaction model is defined
+* [ ] Unit conversion is defined
+* [ ] Supplier model is defined
+* [ ] Purchase model is defined
+* [ ] Recipe model is defined
+* [ ] Production model is defined
+* [ ] Audit model is defined
+* [ ] Offline model is defined
+* [ ] Synchronization strategy is defined
+* [ ] Conflict resolution is defined
+* [ ] Authentication is defined
+* [ ] Authorization is defined
+* [ ] API boundaries are defined
+* [ ] Database indexes/constraints are defined
+* [ ] Security model is defined
+* [ ] Testing strategy is defined
+* [ ] MVP scope is defined
+
+---
+
+# 44. Architecture Status
+
+**Status: Proposed — Pending Technical Review**
+
+This document represents the agreed product and architectural direction.
+
+Before implementation, the architecture should be reviewed for:
+
+* Database normalization
+* Multi-tenant security
+* Offline synchronization correctness
+* Concurrency
+* Authentication
+* Authorization
+* Supabase/Spring Boot responsibility boundaries
+* Scalability
+* Complexity
+* Maintainability
+
+Once these areas have been reviewed and approved, this document becomes:
+
+**Architecture Specification v1.0 — Approved**
+
+Only after approval should implementation begin.
