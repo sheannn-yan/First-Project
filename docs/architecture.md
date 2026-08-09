@@ -1,1199 +1,624 @@
-# Inventory Management System
+# Inventory Management System — Architecture Specification v1.0
 
-## Architecture Specification v1.0
+**Status:** Approved for Implementation Planning
+**Project Type:** Multi-tenant, offline-capable inventory management system
+**Stack:** Next.js (PWA) · Spring Boot · PostgreSQL/Supabase · Supabase Auth · n8n (automation, future)
 
-**Status:** Proposed — Pending Architecture Review
-**Project Type:** Multi-tenant Inventory Management System
-**Primary Goal:** Provide a reliable, configurable, mobile-first inventory system for small and medium businesses.
-
----
-
-# 1. Vision
-
-The system is a configurable inventory management platform designed for businesses such as:
-
-* Bakeries
-* Burger businesses
-* Restaurants
-* Food production businesses
-* Other businesses that manage ingredients, materials, recipes, and stock
-
-The system must solve real inventory problems without unnecessary features or business-specific hard-coding.
-
-The same application must be able to support different businesses through configuration and data.
-
-Example:
-
-### Bakery
-
-* Flour
-* Sugar
-* Yeast
-* Butter
-* Milk
-
-### Burger Business
-
-* Burger buns
-* Beef patties
-* Mayonnaise
-* Cheese
-* Lettuce
-
-The application must not contain business-specific logic such as:
-
-```text
-if business == "Bakery"
-```
-
-Instead, businesses configure their own ingredients, recipes, suppliers, units, branches, and inventory.
+This document is the final Architecture Specification v1.0, incorporating all architectural decisions made during review: current-stock strategy, tenant isolation, authentication, offline MVP scope, recipe versioning, stock-level projection consistency, session/refresh/revocation design, RLS testing discipline, conflict review process, ingredient deactivation behavior, and currency/locale approach. It is the implementation-ready baseline.
 
 ---
 
-# 2. Core Architectural Principles
+## 1. Core Principles
 
-The system follows these principles:
-
-1. **Multi-tenant by design**
-2. **Mobile-first**
-3. **Offline-capable**
-4. **Cloud-backed**
-5. **Auditability**
-6. **Transaction-based inventory**
-7. **Server-side business rules**
-8. **Configuration over hard-coding**
-9. **Modular and feature-oriented architecture**
-10. **Extensible without unnecessary complexity**
-
-Inventory data is business-critical and must prioritize correctness over convenience.
+1. Multi-tenant by design — every tenant-scoped row carries `organization_id`.
+2. The `inventory_transactions` ledger is the single source of truth for stock. `stock_levels` is a cache, updated synchronously in the same DB transaction as the ledger insert, never authoritative history on its own.
+3. Spring Boot is the primary authorization and business-rule enforcement layer. PostgreSQL Row Level Security (RLS) is defense-in-depth, not the primary control, and is proven via mandatory cross-tenant test coverage.
+4. Supabase Auth is the identity provider. Spring Boot owns roles, permissions, organization/branch access, and issues its own short-lived, revocable session tokens.
+5. Offline-first for a defined, practical operation set — not "everything, eventually." Genuine sync conflicts are flagged for human review, not silently resolved.
+6. Recipes are versioned; production always references the recipe version active at the time. Ingredient deactivation is a soft flag that never breaks historical records.
+7. Pricing is currency-agnostic in the schema (decimal + ISO currency code), defaulting to PHP for MVP without assuming a single currency long-term.
+8. AI/n8n/Node-RED are integration/automation layers, never sources of truth for inventory.
 
 ---
 
-# 3. High-Level Architecture
+## 2. High-Level Architecture
 
-```text
-                         USERS
-                           │
-             ┌─────────────┴─────────────┐
-             │                           │
-          Mobile                       Desktop
-             │                           │
-             └─────────────┬─────────────┘
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │   Next.js PWA   │
-                  │    Frontend     │
-                  └────────┬────────┘
-                           │
-             ┌─────────────┴─────────────┐
-             │                           │
-             ▼                           ▼
-      Local Device DB              Spring Boot API
-       (Offline Data)                    │
-             │                           │
-             │                           ▼
-             │                    Business Logic
-             │                           │
-             │                           ▼
-             │                     PostgreSQL
-             │                      / Supabase
-             │                           │
-             └──────────── Sync ─────────┘
-                                         │
-                                         ▼
-                                       n8n
-                                   Automations
+```
+                         USERS (mobile / tablet / desktop)
+                                     │
+                                     ▼
+                          Next.js PWA (Frontend)
+                          ┌─────────┴─────────┐
+                          │                   │
+                     Local IndexedDB     Online API calls
+                    (outbox + cache)          │
+                          │                   ▼
+                          │           Spring Boot API
+                          │        (business rules, authZ)
+                          │                   │
+                          │                   ▼
+                          │            PostgreSQL (Supabase)
+                          │           + Row Level Security
+                          │                   │
+                          └──────Sync─────────┘
+                                     │
+                                     ▼
+                              Supabase Auth
+                          (identity / login / tokens)
+                                     │
+                                     ▼
+                                    n8n
+                            (automation, notifications)
+                                     │
+                          ┌──────────┴──────────┐
+                          ▼                     ▼
+                      Node-RED                 AI
+                    (future, IoT)      (future, insights only)
+```
 
-                         Future Integrations
-                                │
-                         ┌──────┴──────┐
-                         │             │
-                      Node-RED        AI
+**Responsibility boundary:**
+- **Supabase Auth** — issues identity tokens only. Does not own roles/permissions.
+- **Spring Boot** — validates the Supabase-issued token, resolves org/branch/role context, enforces all business rules, is the only writer of `inventory_transactions`.
+- **PostgreSQL/Supabase** — storage + RLS as a second line of defense against cross-tenant leaks (e.g., a missed `WHERE org_id = ?` in a query still can't return another tenant's rows).
+- **Next.js** — UI, offline cache, outbox queue. Never a source of truth for business calculations.
+
+---
+
+## 3. Domain Model
+
+```
+Organization (tenant root)
+ ├─ Branch (1..N)
+ │   └─ InventoryLocation (1..N)          [Main Storage, Kitchen, Freezer...]
+ ├─ Device (registered per branch)
+ ├─ User (identity = Supabase Auth user id)
+ │   └─ UserBranchAccess (user, branch, role)
+ ├─ Role (Owner / Manager / Staff — org-scoped, some roles hidden per org config)
+ ├─ Ingredient
+ │   ├─ UnitConversion (ingredient, from_unit, to_unit, factor)
+ │   └─ SupplierIngredient (ingredient, supplier, price, unit, effective_from)
+ ├─ Supplier
+ ├─ Recipe (versioned)
+ │   └─ RecipeVersion
+ │        └─ RecipeIngredient (recipe_version, ingredient, qty, unit)
+ ├─ Purchase
+ │   └─ PurchaseLine (purchase, ingredient, qty, unit, price)
+ ├─ ProductionRun (references a specific RecipeVersion, not just Recipe)
+ │   └─ ProductionConsumption (production_run, ingredient, qty_consumed)
+ ├─ InventoryTransaction (append-only ledger — source of truth)
+ ├─ StockLevel (cached projection, derived only)
+ └─ AuditLog (generic, references any entity)
+```
+
+**Key modeling decision — Recipe versioning:** `recipes` holds identity/metadata (name, org, active flag). Each edit creates a new `recipe_versions` row. `production_runs.recipe_version_id` is fixed at production time, so a later recipe edit never rewrites history — production records always show exactly what was consumed and why.
+
+---
+
+## 4. Entity-Relationship Diagram (Full)
+
+```
+organizations
+  id PK
+  name
+  created_at
+
+branches
+  id PK
+  organization_id FK -> organizations.id
+  name
+  UNIQUE (organization_id, name)
+
+inventory_locations
+  id PK
+  branch_id FK -> branches.id
+  name
+  UNIQUE (branch_id, name)
+
+users
+  id PK                      -- matches Supabase Auth user id
+  organization_id FK -> organizations.id
+  full_name
+  status (active/disabled)
+  created_at
+
+roles
+  id PK
+  organization_id FK -> organizations.id
+  name (Owner / Manager / Staff / custom)
+  is_visible boolean          -- org can hide unused roles
+
+user_branch_access
+  id PK
+  user_id FK -> users.id
+  branch_id FK -> branches.id
+  role_id FK -> roles.id
+  UNIQUE (user_id, branch_id)
+
+devices
+  id PK
+  organization_id FK -> organizations.id
+  branch_id FK -> branches.id
+  device_key UNIQUE            -- server-issued credential, not client-generated
+  label
+  registered_at
+  last_seen_at
+
+ingredients
+  id PK
+  organization_id FK -> organizations.id
+  name
+  base_unit                    -- canonical unit for internal storage (e.g. gram)
+  min_stock_level nullable
+  max_stock_level nullable
+  status (active/inactive)
+  UNIQUE (organization_id, name)
+
+unit_conversions
+  id PK
+  ingredient_id FK -> ingredients.id
+  unit
+  factor_to_base                -- e.g. "tub" -> 5000 (grams)
+  UNIQUE (ingredient_id, unit)
+
+suppliers
+  id PK
+  organization_id FK -> organizations.id
+  name
+  contact_info
+  status (active/inactive)
+
+supplier_ingredients
+  id PK
+  supplier_id FK -> suppliers.id
+  ingredient_id FK -> ingredients.id
+  unit
+  price                          -- stored as decimal, currency-agnostic
+  currency_code                  -- ISO 4217, default 'PHP' for MVP
+  effective_from date
+  supplier_sku nullable
+  INDEX (ingredient_id, effective_from DESC)   -- latest price lookup
+
+recipes
+  id PK
+  organization_id FK -> organizations.id
+  name
+  status (active/inactive)
+  current_version_id FK -> recipe_versions.id nullable
+
+recipe_versions
+  id PK
+  recipe_id FK -> recipes.id
+  version_number
+  created_at
+  created_by FK -> users.id
+  UNIQUE (recipe_id, version_number)
+
+recipe_ingredients
+  id PK
+  recipe_version_id FK -> recipe_versions.id
+  ingredient_id FK -> ingredients.id
+  quantity
+  unit
+
+purchases
+  id PK
+  organization_id FK -> organizations.id
+  branch_id FK -> branches.id
+  supplier_id FK -> suppliers.id
+  user_id FK -> users.id
+  device_id FK -> devices.id nullable
+  reference_number nullable
+  currency_code                  -- ISO 4217, default 'PHP' for MVP
+  created_at
+
+purchase_lines
+  id PK
+  purchase_id FK -> purchases.id
+  ingredient_id FK -> ingredients.id
+  quantity
+  unit
+  unit_price                     -- decimal, in purchases.currency_code
+
+production_runs
+  id PK
+  organization_id FK -> organizations.id
+  branch_id FK -> branches.id
+  recipe_version_id FK -> recipe_versions.id     -- fixed snapshot reference
+  quantity_produced
+  user_id FK -> users.id
+  device_id FK -> devices.id nullable
+  status (completed / failed_insufficient_stock)
+  created_at
+
+production_consumptions
+  id PK
+  production_run_id FK -> production_runs.id
+  ingredient_id FK -> ingredients.id
+  quantity_consumed
+  unit
+
+inventory_transactions          -- APPEND-ONLY LEDGER, SOURCE OF TRUTH
+  id PK
+  organization_id FK -> organizations.id
+  branch_id FK -> branches.id
+  location_id FK -> inventory_locations.id
+  ingredient_id FK -> ingredients.id
+  type (purchase / production_consumption / adjustment / correction /
+        transfer / return / waste / opening_balance)
+  quantity_delta                 -- signed, in base_unit
+  reference_type nullable        -- 'purchase' / 'production_run' / 'adjustment' etc.
+  reference_id nullable
+  user_id FK -> users.id
+  device_id FK -> devices.id nullable
+  reason nullable                -- required for manual adjustment/correction
+  sync_op_id UUID nullable       -- client-generated, for idempotency
+  status (applied / flagged_for_review)
+  created_at
+  UNIQUE (organization_id, sync_op_id)   -- enforces idempotent sync
+  INDEX (organization_id, location_id, ingredient_id, created_at)
+
+stock_levels                     -- CACHE ONLY, derived from ledger
+  organization_id FK -> organizations.id
+  location_id FK -> inventory_locations.id
+  ingredient_id FK -> ingredients.id
+  quantity_cached
+  last_transaction_id FK -> inventory_transactions.id
+  updated_at
+  PRIMARY KEY (organization_id, location_id, ingredient_id)
+
+audit_logs
+  id PK
+  organization_id FK -> organizations.id
+  user_id FK -> users.id nullable
+  entity
+  entity_id
+  action
+  previous_value jsonb nullable
+  new_value jsonb nullable
+  reason nullable
+  created_at
+  INDEX (organization_id, entity, entity_id, created_at)
+```
+
+**Constraints worth calling out explicitly:**
+- `inventory_transactions` is **insert-only** at the application layer — no UPDATE/DELETE grants for the app's DB role. Corrections are new rows referencing the original (`reference_type = 'correction'`, `reference_id = original_transaction_id`).
+- `stock_levels` is recomputable at any time by replaying `inventory_transactions` — treat it as a materialized view conceptually, even if implemented as a real table for write performance.
+- Every tenant-scoped table has `organization_id` directly (not just via join) so RLS policies can filter without multi-hop joins.
+- `ingredients.status = 'inactive'` is a **soft flag**, never a delete. Historical rows in `recipe_ingredients`, `purchase_lines`, `production_consumptions`, and `inventory_transactions` keep their FK to the ingredient regardless of its current status — historical reads are unaffected. Application-layer validation (not a DB constraint) blocks *new* recipe versions, purchases, or production runs from selecting an inactive ingredient, unless explicitly reactivated first.
+- Pricing (`supplier_ingredients.price`, `purchase_lines.unit_price`) is stored as a plain decimal plus an explicit `currency_code` column, rather than assuming a single currency. MVP defaults every org to `PHP`, but nothing in the ledger or inventory model assumes a currency — multi-currency later means adding per-org currency configuration and FX-aware reporting, not restructuring `inventory_transactions` or `stock_levels` (which never store money, only quantities).
+
+---
+
+## 5. Authentication & Authorization Flow
+
+**Identity provider:** Supabase Auth (handles login, password/OAuth, token issuance, session refresh).
+**Authorization owner:** Spring Boot (roles, permissions, org/branch access, all business rules).
+
+### 5.1 Online login flow
+
+```
+1. User submits credentials to Supabase Auth (via Next.js)
+2. Supabase Auth returns a signed JWT (contains Supabase user id, email)
+3. Next.js calls Spring Boot with the Supabase JWT in Authorization header
+4. Spring Boot verifies the JWT signature against Supabase's public JWKS
+5. Spring Boot looks up `users` by Supabase user id -> resolves organization_id
+6. Spring Boot looks up `user_branch_access` -> resolves role(s) per branch
+7. Spring Boot issues its own short-lived application session (see 5.1.1)
+8. Client uses the Spring-issued access token for all subsequent API calls
+```
+
+Rationale for step 7: embedding org/branch/role directly in a Supabase-controlled token would require Spring Boot to trust claims it didn't issue for authorization decisions. Re-issuing a Spring-signed token keeps Spring Boot as the sole authority over *authorization* claims while Supabase remains sole authority over *identity*.
+
+### 5.1.1 Session, refresh, and revocation design
+
+Spring Boot issues **two** tokens at step 7, mirroring the standard access/refresh pattern:
+
+```
+access_token
+  - Spring-signed JWT
+  - short-lived: 10–15 minutes
+  - claims: user_id, organization_id, branch_roles[], token_version
+  - used on every API request, verified statelessly (signature + expiry)
+
+refresh_token
+  - opaque, random, high-entropy string (not a JWT)
+  - stored server-side in a `refresh_tokens` table:
+      id, user_id, token_hash, device_id nullable, issued_at,
+      expires_at (e.g. 7–30 days), revoked_at nullable
+  - stored client-side only in a secure, httpOnly-equivalent location
+    (secure storage on mobile/PWA context)
+```
+
+**Refresh flow:**
+```
+Client -> POST /api/session/refresh { refresh_token }
+Spring Boot -> hash incoming token, look up refresh_tokens row
+  - not found / revoked / expired -> 401, client forced to re-login
+  - valid -> re-check users.status = 'active' and current
+    user_branch_access (roles may have changed since last issue)
+  - issue new access_token (fresh 10–15 min window, current claims)
+  - rotate refresh_token: revoke old row, insert new row
+    (rotation on every use — detects token theft: a reused old
+    refresh_token after rotation is treated as a compromise signal
+    and revokes the entire token family for that user)
+```
+
+**Why short-lived access + rotating refresh, instead of one long-lived token:** a 10–15 minute access token means a disabled user's existing token expires and is *not* renewed (refresh re-checks `users.status` every time) — so authorization goes stale within minutes, not hours or days, without requiring an active revocation list to be checked on every single request.
+
+**Revocation (explicit, not just expiry):**
+```
+Admin disables a user -> users.status = 'disabled'
+  -> next refresh attempt for that user is rejected (checked in refresh flow above)
+  -> existing access_token remains valid only until its own short expiry lapses
+     (max exposure window = access token lifetime, e.g. 15 minutes)
+
+Admin revokes a specific session/device -> mark that refresh_tokens row revoked_at
+  -> that device can no longer refresh; other devices/sessions for the
+     same user are unaffected unless explicitly revoked too
+
+"Revoke all sessions" (e.g. suspected compromise) -> bulk revoke all
+  refresh_tokens rows for that user_id
+```
+
+**Sensitive operations re-check server state, not just the token:** for high-impact actions — inventory adjustments/corrections, production runs, purchases, role changes — Spring Boot re-reads `users.status` and current `user_branch_access` from the database at request time rather than relying solely on the branch-roles claim embedded in the access token. This closes the gap where a role change or user disablement happens mid-way through a still-valid 15-minute access token window. Low-sensitivity reads (e.g., viewing cached inventory) may rely on the token claims alone for performance.
+
+### 5.2 Device registration flow
+
+```
+1. On first use, device requests registration: POST /api/devices/register
+   (authenticated user + branch context required)
+2. Spring Boot generates a server-issued device_key, stores it against
+   organization_id + branch_id
+3. device_key is stored locally on the device (not user-guessable, not
+   client-generated) and attached to all subsequent writes from that device
+```
+
+This prevents device spoofing — a device identity can't be fabricated client-side.
+
+### 5.3 Offline authentication
+
+```
+- On successful online login, Spring Boot also issues an offline-capable
+  token with a longer expiry (e.g. 12–24h, configurable per org) scoped
+  to read + queue-writes only — this token cannot itself authorize
+  synchronization; sync requests are re-validated fully once online.
+- While offline, the device uses the cached token to permit local UI
+  actions (view cached inventory, queue adjustments/production).
+- No new user can log in on a device while offline unless that user has
+  a previously cached valid offline token issued for that device.
+- All offline-queued writes carry the user_id from the token that was
+  valid when the action was performed — this is validated again at
+  sync time, and rejected if that token/session has since been revoked.
 ```
 
 ---
 
-# 4. Technology Stack
+## 6. Multi-Tenant Isolation Strategy
 
-## Frontend
+**Primary enforcement — Spring Boot:**
+- Every repository query is scoped by `organization_id` derived from the authenticated session context, never from client-supplied input.
+- A shared base repository/interceptor pattern injects `organization_id` into every query automatically, so individual developers can't "forget" the filter.
 
-* Next.js
-* React
-* TypeScript
-* Responsive UI
-* Progressive Web App (PWA)
-* Local browser database for offline capability
+**Defense-in-depth — PostgreSQL RLS:**
+- RLS policies enabled on every tenant-scoped table: `USING (organization_id = current_setting('app.current_org_id')::uuid)`.
+- Spring Boot sets `app.current_org_id` as a session-local Postgres variable at the start of each request-scoped transaction.
+- RLS is **not** used to make authorization decisions (e.g., role checks) — only tenant boundary enforcement. Role/permission logic stays entirely in Spring Boot to avoid the two-systems-drift problem.
+- This means: even if a Spring Boot query has a bug and omits the org filter, the database itself refuses to return cross-tenant rows.
 
-## Backend
+**Explicitly not doing:** Supabase RLS-based *authorization* (role-based row access) — that logic lives only in Spring Boot, so there is one place, not two, where "can this user do X" is decided.
 
-* Java
-* Spring Boot
-* REST API
-* Server-side business rules
-* Validation
-* Authorization
-* Transaction management
+### 6.1 RLS Testing (mandatory)
 
-## Database / Cloud
+RLS is only a real defense if it's proven to work, so it ships with a dedicated, required test suite — not an optional nice-to-have:
 
-* Supabase
-* PostgreSQL
+```
+For every tenant-scoped table:
+  1. Seed two organizations (Org A, Org B) with equivalent rows.
+  2. Open a DB session as Org A (SET app.current_org_id = <org_a_id>).
+  3. Attempt SELECT * FROM <table> — assert ONLY Org A rows returned,
+     never Org B rows, even with no WHERE clause at all.
+  4. Attempt UPDATE/DELETE targeting an Org B row's known id directly
+     — assert 0 rows affected (not an error — RLS silently excludes it).
+  5. Attempt INSERT with organization_id = Org B while session is
+     scoped to Org A — assert rejected by the RLS WITH CHECK clause.
+```
 
-Supabase provides infrastructure around the PostgreSQL database and may also provide authentication, storage, realtime capabilities, and other supporting services where appropriate.
-
-## Automation
-
-* n8n
-
-## Future Integration
-
-* Node-RED
-
-## Future AI
-
-* AI services for insights and natural-language interaction
-
-AI must not become the source of truth for inventory.
+This suite runs against every table in §4 as part of CI (using a real Postgres test container, not mocks — RLS policies cannot be validated against an in-memory or mocked database). A schema migration that adds a new tenant-scoped table without an accompanying RLS test is treated as incomplete, not merely "pending."
 
 ---
 
-# 5. Multi-Tenant Architecture
+## 7. Offline Synchronization
 
-The system supports multiple independent businesses.
+### 7.1 Scope (MVP)
 
-The fundamental hierarchy is:
+Included offline:
+- View cached inventory (last-synced snapshot)
+- Stock adjustments/corrections
+- Production runs
+- Purchases (queued)
 
-```text
-Organization
-│
-├── Users
-│
-├── Roles
-│
-├── Devices
-│
-├── Branches
-│
-├── Suppliers
-│
-├── Ingredients
-│
-├── Recipes
-│
-└── Inventory
+Explicitly deferred to Phase 2:
+- Automatic conflict resolution beyond delta-summing
+- Multi-branch transfer operations while offline
+- Real-time cross-device inventory visibility while offline
+
+### 7.2 Sequence — Online write
+
+```
+Client -> POST /api/inventory/adjustments (sync_op_id generated client-side)
+
+Spring Boot, within a SINGLE database transaction:
+  1. validate business rules
+  2. INSERT inventory_transactions (status=applied)
+  3. UPSERT stock_levels (quantity_cached += delta, last_transaction_id = new id)
+  4. INSERT audit_logs
+  -> COMMIT (all four succeed together, or ALL roll back)
+
+Spring Boot -> 200 OK { transaction_id, status: applied }
 ```
 
-Each organization must be isolated from every other organization.
+**Consistency rule:** steps 2–4 above execute inside one DB transaction (`@Transactional` at the service layer). If the `stock_levels` upsert fails for any reason, the `inventory_transactions` insert is rolled back too — the ledger and its cache can never diverge. Because `stock_levels` is fully recomputable from the ledger, this is also the recovery path: if the cache is ever suspected to be wrong, it can be safely rebuilt with `SELECT SUM(quantity_delta) ... GROUP BY organization_id, location_id, ingredient_id` without touching the ledger.
 
-A user belonging to Organization A must never be able to access Organization B's data.
+### 7.3 Sequence — Offline write, then reconnect
 
-Tenant isolation must be enforced server-side and at the database/security layer where appropriate.
+```
+[OFFLINE]
+Client generates sync_op_id (UUID) at time of action
+Client writes to local outbox (IndexedDB), status = pending
+UI shows: 🟡 Pending synchronization
+
+[RECONNECT]
+Client -> POST /api/sync  { operations: [ {sync_op_id, type, payload}, ... ] }
+Spring Boot, per operation, in received order:
+  1. Check UNIQUE(organization_id, sync_op_id) in inventory_transactions
+     -> if exists: return { sync_op_id, status: already_applied } (idempotent no-op)
+  2. Re-validate business rules against CURRENT server state
+     (e.g., would this drive stock negative)
+  3. If valid: INSERT inventory_transactions, update stock_levels
+     -> return { sync_op_id, status: applied }
+  4. If it's a correction whose "previous_quantity" no longer matches
+     current server state: do NOT apply
+     -> INSERT as status=flagged_for_review
+     -> return { sync_op_id, status: conflict_flagged }
+Client updates local outbox per response:
+  applied -> 🟢 Synchronized
+  already_applied -> 🟢 Synchronized (dedup, no user-visible change)
+  conflict_flagged -> 🔴 Needs review (surfaced to Manager/Owner)
+```
+
+### 7.4 Conflict Handling Rules
+
+| Scenario | Rule |
+|---|---|
+| Two devices offline, both record **delta** operations (purchase, production, waste) against the same ingredient | Both apply — deltas are commutative, sum correctly regardless of order. No conflict. |
+| Two devices offline, both record a **manual correction** (absolute value set) against the same ingredient | Second one to sync is compared against the server's `previous_quantity` at that point. If mismatched, flagged for review — never silently applied. |
+| Offline production would drive stock negative once server-side deltas are applied | Rejected at sync time (`status: failed_insufficient_stock`), surfaced to the user, not silently clamped to zero. |
+| Same `sync_op_id` submitted twice (retry) | No-op, returns `already_applied`. |
+| Device was offline long enough that its cached auth token expired | Sync request rejected with re-auth required; queued items remain pending locally until the device re-authenticates. |
+
+### 7.5 Conflict Review Process (MVP)
+
+Flagged-for-review items appear in a dedicated review queue, visible only to Manager/Owner roles, showing:
+- Both conflicting values (server's current state vs. the rejected offline correction)
+- Who performed each, on which device, at what time
+- The ingredient/location context
+
+Resolution flow:
+```
+Manager/Owner opens the flagged item -> chooses the correct final quantity
+  (may match either side, or be a new value entirely)
+Spring Boot -> INSERT a new inventory_transactions row
+  (type = 'correction', reference_type = 'conflict_resolution',
+   reference_id = the flagged transaction's id, reason = required text)
+Spring Boot -> mark the original flagged_for_review row's status
+  = 'resolved' (the flagged row itself is never edited or deleted —
+   it remains as a permanent record that a conflict occurred)
+Spring Boot -> INSERT audit_logs entry for the resolution action
+```
+
+This keeps the ledger's insert-only guarantee intact even for conflict resolution — nothing is ever rewritten, only appended to. There is currently no enforced SLA on how quickly a flagged item must be resolved; it remains visible in the queue indefinitely until acted on (tracked as an open item in §14).
 
 ---
 
-# 6. Branch Architecture
+## 8. API Boundaries
 
-An organization may have one or multiple branches.
+```
+Auth
+  (Supabase Auth handles login directly — Next.js talks to Supabase SDK)
+  POST /api/session/exchange        -- exchange Supabase JWT for Spring access+refresh tokens
+  POST /api/session/refresh         -- rotate refresh token, issue new access token
+  POST /api/session/revoke          -- revoke current device session
+  POST /api/session/revoke-all      -- revoke all sessions for the authenticated user
 
-Example:
+Devices
+  POST /api/devices/register
 
-```text
-Minute Burger
-│
-├── Branch 1
-│   ├── Main Storage
-│   └── Kitchen
-│
-├── Branch 2
-│   ├── Main Storage
-│   └── Kitchen
-│
-└── Branch 3
-    ├── Main Storage
-    └── Kitchen
+Organizations / Branches / Locations
+  GET/POST/PUT   /api/organizations/{id}
+  GET/POST/PUT   /api/branches
+  GET/POST/PUT   /api/branches/{id}/locations
+
+Users / Roles / Access
+  GET/POST/PUT   /api/users
+  GET/POST/PUT   /api/roles
+  GET/POST/PUT   /api/users/{id}/branch-access
+
+Ingredients / Units
+  GET/POST/PUT   /api/ingredients
+  PUT            /api/ingredients/{id}/status        -- activate/deactivate (soft flag only)
+  GET/POST/PUT   /api/ingredients/{id}/conversions
+
+Suppliers
+  GET/POST/PUT   /api/suppliers
+  GET/POST/PUT   /api/suppliers/{id}/ingredients
+
+Purchases
+  GET/POST       /api/purchases
+
+Recipes
+  GET/POST       /api/recipes
+  POST           /api/recipes/{id}/versions        -- creates new version
+  GET            /api/recipes/{id}/versions/{v}
+
+Production
+  POST           /api/production                    -- validates stock, creates run
+  GET            /api/production
+
+Inventory
+  GET            /api/inventory/stock                -- reads stock_levels
+  GET            /api/inventory/transactions          -- ledger, audit view
+  POST           /api/inventory/adjustments            -- manual correction, reason required
+
+Sync
+  POST           /api/sync                            -- batched offline replay
+  GET            /api/sync/conflicts                  -- flagged-for-review queue (Manager/Owner)
+  POST           /api/sync/conflicts/{id}/resolve      -- resolve, creates new ledger entry
+
+Audit
+  GET            /api/audit
 ```
 
-The system must support both:
-
-```text
-Business → One Branch
-```
-
-and:
-
-```text
-Business → Multiple Branches
-```
-
-without requiring separate applications.
+Every endpoint requires the Spring-issued session token; org/branch context resolved server-side, never trusted from request body/query params.
 
 ---
 
-# 7. Inventory Locations
+## 9. Spring Boot Package Structure
 
-A branch may contain multiple inventory locations.
-
-Examples:
-
-* Main Storage
-* Kitchen
-* Freezer
-* Refrigerator
-* Warehouse
-
-The system must distinguish:
-
-```text
-Supplier Location
 ```
-
-from:
-
-```text
-Business Branch
-```
-
-and:
-
-```text
-Inventory Location
-```
-
-Future inventory transfers between branches and locations should be possible without requiring a major architectural redesign.
-
----
-
-# 8. Users and Roles
-
-The system supports:
-
-* Owner
-* Manager
-* Staff
-
-Not every organization must use every role.
-
-For example:
-
-```text
-Small Business
-├── Owner
-└── Staff
-```
-
-Another organization may use:
-
-```text
-Larger Business
-├── Owner
-├── Manager
-└── Staff
-```
-
-Unused roles may be hidden from the organization's UI.
-
-Roles should control permissions.
-
-Permissions may also be restricted by branch.
-
-Example:
-
-```text
-Staff A
-→ Branch 1
-
-Staff B
-→ Branch 2
-
-Manager
-→ Branch 1 + Branch 2 + Branch 3
-
-Owner
-→ Entire organization
-```
-
----
-
-# 9. Authentication
-
-Authentication is required.
-
-The system must identify the authenticated user for important actions.
-
-A device does not represent a user.
-
-Example:
-
-```text
-Tablet #01
-
-Morning:
-Maria logs in
-
-Afternoon:
-John logs in
-
-Evening:
-Pedro logs in
-```
-
-Actions must be attributed to:
-
-* User
-* Organization
-* Branch
-* Device
-* Timestamp
-
-Authentication must remain secure even when offline capabilities are introduced.
-
-Offline authentication behavior must be explicitly designed and tested.
-
----
-
-# 10. Device Tracking
-
-Devices should have a unique device identity.
-
-Example:
-
-```text
-Device:
-TABLET-01
-
-Organization:
-Minute Burger
-
-Branch:
-Branch 1
-```
-
-A device may be shared by multiple users.
-
-Therefore:
-
-```text
-Device ID ≠ User ID
-```
-
-Both must be recorded when appropriate.
-
----
-
-# 11. Inventory Model
-
-Inventory must be transaction-based.
-
-The system must not rely solely on overwriting a single current quantity.
-
-Example:
-
-```text
-Initial stock       +25 kg
-Purchase            +10 kg
-Production           -5 kg
-Manual adjustment    -1 kg
---------------------------------
-Current stock        29 kg
-```
-
-Inventory movements should be represented as transactions.
-
-Possible transaction types include:
-
-* Opening balance
-* Purchase
-* Production consumption
-* Stock adjustment
-* Stock correction
-* Transfer
-* Return
-* Waste
-* Other controlled inventory events
-
-Transaction types should be extensible.
-
----
-
-# 12. Inventory Adjustments
-
-Manual corrections are allowed.
-
-However, important corrections require a reason.
-
-Example:
-
-```text
-System:
-Flour = 5 kg
-
-Actual:
-Flour = 4 kg
-```
-
-The user selects:
-
-```text
-Adjust Stock
-```
-
-and provides:
-
-```text
-New quantity:
-4 kg
-
-Reason:
-Incorrect quantity entered
-```
-
-The system records:
-
-```text
-User
-Organization
-Branch
-Device
-Ingredient
-Previous quantity
-New quantity
-Difference
-Reason
-Timestamp
-```
-
-No approval is required for normal manual corrections.
-
-The reason is mandatory.
-
----
-
-# 13. Audit Trail
-
-Important business actions must be auditable.
-
-The system should answer:
-
-> Who changed it?
-
-> What changed?
-
-> When did it change?
-
-> Where did it happen?
-
-> On which device?
-
-> Why was it changed?
-
-Audit information should include where applicable:
-
-```text
-user_id
-organization_id
-branch_id
-device_id
-action
-entity
-entity_id
-previous_value
-new_value
-reason
-timestamp
-```
-
-Important historical transactions should not be physically deleted.
-
-Instead, use controlled cancellation/voiding where appropriate.
-
----
-
-# 14. Units
-
-The system must support flexible units.
-
-Examples:
-
-* Piece
-* Gram
-* Kilogram
-* Milliliter
-* Liter
-* Box
-* Bag
-* Tub
-* Bottle
-* Pack
-* Tray
-
-Units must not be hard-coded into business logic.
-
-Businesses may configure appropriate units.
-
----
-
-# 15. Unit Conversion
-
-Purchase units and consumption units may be different.
-
-Example:
-
-```text
-Mayonnaise
-
-1 Tub = 5 kg
-```
-
-Recipe:
-
-```text
-20 g mayonnaise / burger
-```
-
-Inventory internally needs a reliable representation that allows:
-
-```text
-2 tubs
-=
-10 kg
-=
-10,000 g
-```
-
-Producing:
-
-```text
-100 burgers
-```
-
-consumes:
-
-```text
-2,000 g
-```
-
-Remaining:
-
-```text
-8,000 g
-```
-
-The system must support explicit conversion relationships.
-
-Non-convertible units such as:
-
-```text
-Box
-Pack
-Piece
-```
-
-must require an explicit business-defined relationship before conversion.
-
----
-
-# 16. Ingredients
-
-An ingredient represents an inventory-controlled item.
-
-Example:
-
-```text
-Ingredient:
-Mayonnaise
-
-Base measurement:
-Gram
-
-Purchase units:
-Tub
-
-Suppliers:
-Supplier A
-Supplier B
-```
-
-Ingredients should support:
-
-* Name
-* Description
-* Category
-* Unit configuration
-* Minimum stock level
-* Maximum stock level if needed
-* Active/inactive state
-* Supplier relationships
-* Branch/location availability
-
----
-
-# 17. Suppliers
-
-Suppliers belong to an organization.
-
-A supplier may provide multiple ingredients.
-
-An ingredient may have multiple suppliers.
-
-Supplier information may include:
-
-* Name
-* Contact information
-* Address/location
-* Pickup/delivery information
-* Notes
-* Active/inactive status
-
-Supplier-item relationships may include:
-
-* Supplier
-* Ingredient
-* Purchase unit
-* Unit conversion
-* Price
-* Effective date
-* Supplier SKU/reference
-
-Supplier price history should be preserved where appropriate.
-
----
-
-# 18. Purchases
-
-The system should support purchase records.
-
-Example:
-
-```text
-Supplier:
-ABC Supplier
-
-Date:
-August 9, 2026
-
-Items:
-
-3 bags Flour
-2 tubs Mayonnaise
-```
-
-Purchases should create inventory transactions.
-
-Purchase records should preserve:
-
-* Supplier
-* Branch/location
-* User
-* Device
-* Date/time
-* Items
-* Quantities
-* Units
-* Prices
-* Total
-* Reference number if applicable
-
----
-
-# 19. Recipes
-
-Recipes are configurable business data.
-
-Example:
-
-```text
-Classic Burger
-
-1 × Bun
-1 × Beef Patty
-20 g Mayonnaise
-1 × Cheese Slice
-30 g Lettuce
-```
-
-A bakery may instead define:
-
-```text
-Bread
-
-500 g Flour
-50 g Sugar
-5 g Yeast
-20 g Butter
-250 ml Water
-```
-
-Recipes must support:
-
-* Create
-* Edit
-* Activate/deactivate
-* Ingredients
-* Quantities
-* Consumption units
-* Recipe versions/history where necessary
-
-Recipes must not be hard-coded.
-
----
-
-# 20. Production
-
-Production connects recipes to inventory.
-
-Example:
-
-```text
-Produce:
-50 Classic Burgers
-```
-
-The system calculates required ingredients.
-
-Example:
-
-```text
-50 Buns
-50 Beef Patties
-1,000 g Mayonnaise
-50 Cheese Slices
-1,500 g Lettuce
-```
-
-The backend validates inventory availability and creates appropriate inventory transactions.
-
-Production must be atomic where appropriate.
-
-A partially completed production transaction should not leave inventory in an inconsistent state.
-
----
-
-# 21. Inventory Search and Filtering
-
-Inventory must support:
-
-* Live search while typing
-* Sorting
-* Filtering
-* Supplier filtering
-* Branch filtering
-* Location filtering
-* Low-stock filtering
-* Unit filtering
-* Status filtering
-
-Desktop may use tables.
-
-Mobile should use a responsive list/card representation where appropriate.
-
----
-
-# 22. Mobile-First Design
-
-The system must prioritize:
-
-* Android phones
-* iPhones
-* Tablets
-
-Desktop/laptop support is also required.
-
-The system should not simply shrink a desktop interface onto a phone.
-
-Mobile workflows should prioritize:
-
-* Fast searching
-* Quick stock checks
-* Quick adjustments
-* Production entry
-* Purchase entry
-* Clear status indicators
-* Minimal unnecessary navigation
-
----
-
-# 23. Progressive Web App
-
-The frontend should be designed as a PWA.
-
-Users should eventually be able to install the application on supported devices.
-
-Example:
-
-```text
-Phone
- ↓
-Open Web Application
- ↓
-Install/Add to Home Screen
- ↓
-Inventory Application
-```
-
-The PWA should support offline operation where technically appropriate.
-
----
-
-# 24. Offline Architecture
-
-The system must continue operating during temporary internet outages.
-
-The device should maintain local application data required for offline workflows.
-
-Conceptually:
-
-```text
-Next.js PWA
-│
-├── Online
-│    └── Spring Boot API
-│
-└── Offline
-     └── Local Database
-          └── Pending Operations
-```
-
-Offline operations may include:
-
-* Viewing cached inventory
-* Stock adjustments
-* Production
-* Other approved inventory operations
-
-The exact offline feature set must be defined during implementation.
-
----
-
-# 25. Synchronization
-
-Offline operations must be queued.
-
-Example:
-
-```text
-Pending Operations
-
-001  STOCK_ADJUSTMENT  Pending
-002  PRODUCTION        Pending
-003  PURCHASE          Pending
-```
-
-When connectivity returns:
-
-```text
-Local Queue
-    ↓
-Synchronization
-    ↓
-Spring Boot
-    ↓
-Validation
-    ↓
-PostgreSQL
-    ↓
-Synchronization Result
-```
-
-Each operation should have a globally unique transaction/operation identifier.
-
-Synchronization must support:
-
-* Idempotency
-* Retry
-* Duplicate prevention
-* Partial failure handling
-* Server validation
-* Conflict detection
-* Conflict resolution
-
-The system must not simply overwrite server inventory with a stale local quantity.
-
-Inventory changes should synchronize as business events/transactions where possible.
-
----
-
-# 26. Offline Conflict Example
-
-Example:
-
-Initial stock:
-
-```text
-25 kg
-```
-
-Device A offline:
-
-```text
-Consumes 5 kg
-```
-
-Device B offline:
-
-```text
-Receives 10 kg
-```
-
-When both reconnect, the system should process the operations safely:
-
-```text
-25
--5
-+10
-----
-30 kg
-```
-
-It must not perform:
-
-```text
-Device A current = 20
-Device B current = 35
-
-Last device wins
-```
-
-because this could destroy legitimate inventory activity.
-
-Conflict handling rules must be explicitly documented and tested.
-
----
-
-# 27. Backend Responsibilities
-
-Spring Boot is responsible for:
-
-* Business rules
-* Inventory calculations
-* Unit conversion validation
-* Production calculations
-* Inventory transaction creation
-* Authorization
-* Validation
-* Concurrency handling
-* Audit creation
-* Synchronization validation
-* API contracts
-
-Critical business rules must not depend solely on frontend validation.
-
----
-
-# 28. Frontend Responsibilities
-
-Next.js is responsible for:
-
-* User interface
-* Responsive design
-* PWA behavior
-* User interactions
-* Local offline storage
-* Sync status
-* API communication
-* Client-side validation
-* Presentation
-
-The frontend should not be the final authority for business-critical calculations.
-
----
-
-# 29. Supabase Responsibilities
-
-Supabase/PostgreSQL is responsible for persistent cloud data storage and supporting infrastructure.
-
-Potential capabilities:
-
-* PostgreSQL
-* Authentication where appropriate
-* Row Level Security
-* Storage if required
-* Realtime capabilities where useful
-
-The final architecture must clearly define the boundary between:
-
-```text
-Next.js
-Spring Boot
-Supabase
-```
-
-Business-critical inventory operations should remain controlled by the backend/database architecture rather than being freely writable from the frontend.
-
----
-
-# 30. n8n Responsibilities
-
-n8n is an automation/integration layer.
-
-Potential workflows:
-
-```text
-Low stock
-   ↓
-n8n
-   ↓
-Notification
-```
-
-```text
-Scheduled report
-   ↓
-n8n
-   ↓
-Owner notification
-```
-
-```text
-Supplier reminder
-   ↓
-n8n
-```
-
-n8n must not become the source of truth for inventory.
-
----
-
-# 31. Node-RED Responsibilities
-
-Node-RED is optional and future-facing.
-
-Potential integrations:
-
-* Digital weighing scales
-* Sensors
-* Barcode scanners
-* IoT devices
-* Hardware systems
-
-Node-RED should connect through defined integration/API boundaries.
-
-It is not required for the core application.
-
----
-
-# 32. AI Responsibilities
-
-AI is optional and future-facing.
-
-Potential capabilities:
-
-* Inventory summaries
-* Natural-language inventory questions
-* Purchasing suggestions
-* Trend explanations
-* Anomaly explanations
-
-AI must not directly determine authoritative inventory quantities.
-
-For example:
-
-```text
-AI:
-"You may need more flour next week."
-```
-
-is acceptable.
-
-But:
-
-```text
-AI:
-"Set flour stock to 50 kg."
-```
-
-must not bypass deterministic business rules and authorization.
-
----
-
-# 33. Suggested Domain Boundaries
-
-The backend should be organized around business capabilities rather than only technical layers.
-
-Potential domains:
-
-```text
-authentication
-organization
-user
-role
-branch
-device
-ingredient
-unit
-supplier
-purchase
-recipe
-production
-inventory
-audit
-synchronization
-```
-
-This list may be refined during detailed design.
-
----
-
-# 34. Backend Folder Structure
-
-The backend should use a feature/domain-oriented structure.
-
-Conceptually:
-
-```text
 backend/
-└── src/
-    └── main/
-        └── java/
-            └── com/
-                └── application/
-                    │
-                    ├── authentication/
-                    ├── organization/
-                    ├── user/
-                    ├── role/
-                    ├── branch/
-                    ├── device/
-                    ├── ingredient/
-                    ├── unit/
-                    ├── supplier/
-                    ├── purchase/
-                    ├── recipe/
-                    ├── production/
-                    ├── inventory/
-                    ├── audit/
-                    ├── synchronization/
-                    │
-                    └── common/
+└── src/main/java/com/application/
+    ├── auth/                 -- Supabase token verification, session issuance
+    ├── organization/
+    ├── branch/
+    ├── device/
+    ├── user/
+    ├── role/
+    ├── ingredient/
+    ├── unit/
+    ├── supplier/
+    ├── purchase/
+    ├── recipe/                -- recipes + recipe_versions
+    ├── production/
+    ├── inventory/              -- ledger, stock_levels projection, adjustments
+    ├── sync/                   -- idempotency, conflict flagging, /api/sync
+    ├── audit/
+    └── common/
+        ├── security/           -- RLS session var setter, tenant context filter
+        ├── exception/
+        └── validation/
 ```
 
-Each domain may contain appropriate:
-
-```text
-controller
-service
-repository
-domain/model
-dto
-mapper
-validation
-```
-
-The exact structure should be refined during implementation.
+Each domain module: `controller/`, `service/`, `repository/`, `domain/`, `dto/`, `mapper/`.
 
 ---
 
-# 35. Frontend Folder Structure
+## 10. Next.js Folder Structure
 
-The frontend should also use feature-oriented organization.
-
-Conceptually:
-
-```text
+```
 frontend/
 ├── app/
 ├── features/
-│   ├── authentication/
+│   ├── auth/
 │   ├── inventory/
 │   ├── ingredients/
 │   ├── suppliers/
@@ -1202,306 +627,106 @@ frontend/
 │   ├── production/
 │   ├── branches/
 │   └── users/
-│
 ├── components/
 ├── lib/
-│   ├── api/
-│   ├── database/
-│   ├── synchronization/
+│   ├── api/                  -- Spring Boot API client
+│   ├── supabase/              -- Supabase Auth client
+│   ├── local-db/               -- IndexedDB/Dexie schema (cache + outbox)
+│   ├── sync/                    -- outbox queue, retry, status tracking
 │   └── validation/
-│
 ├── hooks/
 ├── types/
 └── public/
 ```
 
-The final Next.js structure should follow the current framework conventions chosen during implementation.
+---
+
+## 11. MVP vs Phase 2
+
+### MVP
+- Auth (Supabase Auth + Spring session exchange), roles, branch access
+- Organizations, branches, locations, device registration
+- Ingredients, units, unit conversion
+- Suppliers, supplier pricing, purchases
+- Recipes (versioned), production with stock validation
+- Ledger-based inventory transactions + stock_levels projection
+- Manual adjustments/corrections with mandatory reason
+- Audit trail
+- Offline: outbox + idempotent sync for adjustments/production/purchases, conflict flagging (not auto-resolution)
+- Search/filter/sort on inventory
+- Responsive UI, installable PWA
+
+### Phase 2
+- Automatic conflict resolution beyond delta-summing
+- Inventory transfers between branches/locations
+- Advanced reporting, stock forecasting
+- Notifications, n8n automation workflows
+- Advanced permission granularity
+
+### Future
+- AI insights/natural-language queries (recommend-only, never authoritative)
+- Node-RED / IoT / barcode / digital scale integrations
 
 ---
 
-# 36. API Boundary
+## 12. Security Considerations
 
-The system should expose business-oriented REST APIs.
-
-Potential areas:
-
-```text
-/api/auth
-/api/organizations
-/api/users
-/api/branches
-/api/devices
-/api/ingredients
-/api/units
-/api/suppliers
-/api/purchases
-/api/recipes
-/api/production
-/api/inventory
-/api/audit
-/api/synchronization
-```
-
-Exact endpoints should be defined during API design.
+- No secrets in source control; environment variables / secret manager for Supabase keys, DB credentials, JWT signing keys.
+- `inventory_transactions` insert-only at the DB role level (no UPDATE/DELETE grants).
+- RLS enabled on all tenant tables as defense-in-depth (see §6), with mandatory cross-tenant-access test coverage (see §6.1) — no new tenant-scoped table ships without it.
+- Access tokens are short-lived (10–15 min); refresh tokens are rotated on every use and revocable server-side, so a disabled user's authorization lapses within one access-token window at most (see §5.1.1).
+- Sensitive write operations (adjustments, production, purchases, role changes) re-check `users.status` and current role/branch access from the database, not just token claims.
+- Device credentials are server-issued, not client-generated.
+- Idempotency key (`sync_op_id`) required on every write-through-sync endpoint to prevent replay-driven duplication.
+- Offline tokens are scoped (read + queue-only) and time-limited; full validation happens again at sync time regardless of what the offline token permitted locally.
+- Rate limiting on `/api/sync` and `/api/session/*` endpoints.
+- All audit log entries immutable (insert-only), same as the inventory ledger.
+- Conflict resolution never edits historical rows — it appends a new ledger entry and marks the original flagged row `resolved`, preserving a full record of what happened.
 
 ---
 
-# 37. Security Requirements
+## 13. Testing Strategy
 
-Security must include:
+**Backend:** unit tests per service (especially unit-conversion math and stock-sufficiency checks), repository/integration tests against a real Postgres test container, API contract tests, concurrency tests specifically for simultaneous writes to the same `(organization_id, location_id, ingredient_id)`.
 
-* Authentication
-* Authorization
-* Tenant isolation
-* Branch access control
-* Server-side validation
-* Database constraints
-* Secure secrets
-* API protection
-* Audit logging
-* Secure device identification
-* Safe offline authentication
-* Protection against duplicate/replayed synchronization requests
+**RLS suite (mandatory, see §6.1):** cross-tenant SELECT/UPDATE/DELETE/INSERT attempts against every tenant-scoped table, run in CI against a real Postgres container.
 
-No secret keys should be committed to Git.
+**Session/auth suite:** access token expiry enforcement, refresh token rotation and reuse-detection (stolen-token scenario), revocation propagation (disabled user rejected on next refresh; explicit session revoke blocks that device only; revoke-all blocks every device), sensitive-operation re-check behavior (role changed mid-session denies the stale-claim action).
 
-Environment variables must be used for credentials and secrets.
+**Frontend:** component tests, form validation tests, offline-mode tests (outbox queuing, sync status transitions).
+
+**End-to-end:** login → select branch → view inventory → purchase → produce → stock decreases → adjust with reason → audit recorded.
+
+**Synchronization-specific (critical path, needs dedicated suite):** offline queue → reconnect → idempotent replay of duplicate `sync_op_id` → simultaneous corrections from two devices → production that would go negative once server deltas applied → expired offline token attempting sync.
 
 ---
 
-# 38. Testing Requirements
+## 14. Resolution Status and Remaining Open Items
 
-The system should eventually include:
+All eleven architectural decisions raised across this review (the original five, plus the six follow-ups) are now incorporated:
 
-### Backend
+| # | Item | Status |
+|---|---|---|
+| 1 | Current-stock strategy | ✅ Resolved — ledger source of truth, cached projection |
+| 2 | Tenant isolation ownership | ✅ Resolved — Spring Boot primary, RLS defense-in-depth |
+| 3 | Authentication provider | ✅ Resolved — Supabase Auth (identity) + Spring Boot (authorization) |
+| 4 | Offline MVP scope | ✅ Resolved — outbox + idempotent sync, conflict flagging only |
+| 5 | Recipe versioning | ✅ Resolved — `recipe_versions`, production pins a version |
+| 6 | Stock-level projection consistency | ✅ Resolved — synchronous, single-transaction, rollback-safe (§7.2) |
+| 7 | Session/refresh/revocation design | ✅ Resolved — short-lived access + rotating refresh (§5.1.1) |
+| 8 | RLS testing | ✅ Resolved — mandatory cross-tenant test suite, CI-enforced (§6.1) |
+| 9 | Conflict review ownership | ✅ Resolved — Manager/Owner queue, append-only resolution (§7.5) |
+| 10 | Ingredient deactivation | ✅ Resolved — soft flag, historical reads unaffected (§4 constraints) |
+| 11 | Currency/locale | ✅ Resolved — PHP default, currency-agnostic schema (§4 constraints) |
 
-* Unit tests
-* Service tests
-* Repository/integration tests
-* API tests
-* Transaction tests
-* Concurrency tests
+### Remaining items (minor, non-blocking)
 
-### Frontend
+These are worth deciding early in implementation but don't block starting:
 
-* Component tests
-* Form validation tests
-* Integration tests
-* Offline behavior tests
+1. **Conflict-review SLA** — no enforced time limit on resolving flagged items yet. Recommend a simple dashboard indicator (e.g., "3 items pending review, oldest 2 days") rather than a hard SLA for MVP; revisit if it proves to be a real operational problem.
+2. **Refresh token storage on the client** — the exact secure-storage mechanism on each target platform (web PWA vs. installed/mobile-wrapped context) needs a platform-specific decision during frontend implementation; the server-side design (§5.1.1) is unaffected by that choice.
+3. **RLS policy maintenance process** — as new tenant-scoped tables are added post-MVP, confirm the team has a checklist/PR template step ("added RLS policy + test") so §6.1's discipline doesn't erode over time. Process, not architecture — worth a line in the contribution guide.
 
-### End-to-End
+### Architecture Status: **READY FOR IMPLEMENTATION**
 
-Test important workflows:
-
-```text
-Login
-→ Select branch
-→ View inventory
-→ Purchase stock
-→ Produce product
-→ Stock decreases
-→ Adjust stock
-→ Enter reason
-→ Audit recorded
-```
-
-### Synchronization
-
-Test:
-
-* Offline operation
-* Reconnection
-* Retry
-* Duplicate submission
-* Concurrent changes
-* Conflict handling
-* Partial synchronization
-
----
-
-# 39. MVP
-
-The first usable version should focus on the core inventory problem.
-
-## MVP
-
-### Authentication
-
-* Login
-* Users
-* Roles
-* Branch access
-
-### Organization
-
-* Business
-* Branches
-* Devices
-
-### Inventory
-
-* Ingredients
-* Units
-* Unit conversion
-* Stock
-* Inventory transactions
-* Manual adjustments
-* Audit trail
-* Search
-* Sorting
-* Filtering
-
-### Suppliers
-
-* Supplier management
-* Supplier items
-* Supplier pricing
-* Purchase records
-
-### Recipes
-
-* Create recipes
-* Add ingredients
-* Define quantities
-* Production
-* Automatic inventory consumption
-
-### PWA
-
-* Responsive UI
-* Basic offline foundation
-
-The exact offline transaction scope should be finalized during implementation.
-
----
-
-# 40. Phase 2
-
-Potential features:
-
-* Full offline synchronization
-* Advanced inventory transfers
-* Advanced reports
-* Purchase recommendations
-* Stock forecasting
-* More detailed supplier management
-* Advanced permissions
-* Notifications
-* n8n automation
-
----
-
-# 41. Future
-
-Potential future capabilities:
-
-* AI inventory assistant
-* Demand forecasting
-* Natural-language reports
-* Automated purchasing suggestions
-* Barcode scanning
-* Digital scales
-* IoT integrations
-* Node-RED integrations
-* Advanced analytics
-
-These must not compromise the reliability of the core inventory system.
-
----
-
-# 42. Important Architectural Rule
-
-The system should follow this principle:
-
-```text
-USER
- ↓
-Next.js PWA
- ↓
-Spring Boot
- ↓
-Business Rules
- ↓
-Inventory Transactions
- ↓
-PostgreSQL / Supabase
-```
-
-While:
-
-```text
-n8n
-```
-
-handles automation,
-
-```text
-Node-RED
-```
-
-handles future hardware/integration requirements,
-
-and:
-
-```text
-AI
-```
-
-provides optional intelligence and recommendations.
-
-The core inventory system must remain deterministic and auditable.
-
----
-
-# 43. Architecture Review Checklist
-
-Before implementation begins, verify:
-
-* [ ] Multi-tenant isolation is defined
-* [ ] Branch access is defined
-* [ ] Roles and permissions are defined
-* [ ] Device tracking is defined
-* [ ] Inventory transaction model is defined
-* [ ] Unit conversion is defined
-* [ ] Supplier model is defined
-* [ ] Purchase model is defined
-* [ ] Recipe model is defined
-* [ ] Production model is defined
-* [ ] Audit model is defined
-* [ ] Offline model is defined
-* [ ] Synchronization strategy is defined
-* [ ] Conflict resolution is defined
-* [ ] Authentication is defined
-* [ ] Authorization is defined
-* [ ] API boundaries are defined
-* [ ] Database indexes/constraints are defined
-* [ ] Security model is defined
-* [ ] Testing strategy is defined
-* [ ] MVP scope is defined
-
----
-
-# 44. Architecture Status
-
-**Status: Proposed — Pending Technical Review**
-
-This document represents the agreed product and architectural direction.
-
-Before implementation, the architecture should be reviewed for:
-
-* Database normalization
-* Multi-tenant security
-* Offline synchronization correctness
-* Concurrency
-* Authentication
-* Authorization
-* Supabase/Spring Boot responsibility boundaries
-* Scalability
-* Complexity
-* Maintainability
-
-Once these areas have been reviewed and approved, this document becomes:
-
-**Architecture Specification v1.0 — Approved**
-
-Only after approval should implementation begin.
+No remaining architectural blockers. The three items above are implementation-detail/process items to track, not open design questions that would change the schema, API boundaries, or core flows described in this document.
